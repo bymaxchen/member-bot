@@ -1,0 +1,21 @@
+{
+  "name": "membership-sync",
+  "version": "0.2.0",
+  "description": "Sync Fansky orders to MySQL for Telegram membership bot",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "scrape:once": "node src/index.js --once",
+    "db:peek": "node src/peek.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "mysql2": "^3.11.4",
+    "node-cron": "^3.0.3",
+    "pino": "^9.5.0",
+    "pino-pretty": "^11.2.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
