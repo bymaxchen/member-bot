@@ -25,6 +25,7 @@ import { logger } from './logger.js';
 
 const FANSKY_SUBSCRIBE_URL =
     process.env.FANSKY_SUBSCRIBE_URL || 'https://www.fansky.net/';
+const OWNER_CONTACT = process.env.OWNER_CONTACT || '群主';
 
 const ORDER_NO_RE = /^(FS|FSM)-\d+$/;
 const VERIFY_RATE_LIMIT = 5; // 10 分钟内最多 5 次错误
@@ -92,19 +93,10 @@ bot.start(async (ctx) => {
   await ctx.reply(
       `你好,我是会员管理 bot 👋\n\n` +
       `你的用户 ID: <code>${ctx.from.id}</code>\n\n` +
-      `<b>购买会员</b>\n` +
-      `  永久会员 119 元：\n` +
-      `  https://www.fansky.co/aiglobalclass/18\n\n` +
-      `  月度会员 29 元：\n` +
-      `  https://www.fansky.co/aiglobalclass/membership\n\n` +
       `<b>购买后如何开通</b>\n` +
-      `  付款完成后,在 Fansky 订单列表复制订单号,直接发给我即可自动开通。\n` +
-      `  开通成功后,我会把进群链接发给你。\n` +
-      `  永久会员订单号通常以 <code>FS-</code> 开头\n` +
-      `  月度会员订单号通常以 <code>FSM-</code> 开头\n\n` +
-      `<b>也可以使用命令</b>\n` +
-      `  /verify &lt;订单号&gt;\n` +
-      `  例如: <code>/verify FS-2026********</code>\n\n` +
+      `  付款完成后,把以下两条信息发给${OWNER_CONTACT},由群主为你开通会员:\n` +
+      `  1. 你的用户 ID: <code>${ctx.from.id}</code>\n` +
+      `  2. Fansky 订单号 (在 Fansky 订单列表复制, <code>FS-</code> 或 <code>FSM-</code> 开头)\n\n` +
       `<b>常用命令</b>\n` +
       `  /status — 查看自己的会员状态\n` +
       `  /help — 显示帮助`,
