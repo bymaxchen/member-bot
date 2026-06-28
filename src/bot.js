@@ -362,75 +362,35 @@ bot.command('status', async (ctx) => {
 });
 
 // ============================================================
-// /grant @user monthly|lifetime [YYYY-MM-DD]
+// /grant @user [monthly [YYYY-MM-DD] | lifetime]
+//   不传类型 → 弹 inline 按钮 (月度 / 永久) 让 admin 选
+//   monthly 不传日期 → 默认今天
 // ============================================================
-bot.command('grant', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) return;
-  const parts = ctx.message.text.split(/\s+/);
-  const userArg = parts[1];
-  const typeArg = parts[2];
-  const dateArg = parts[3]; // monthly 时是付款日, 必填
-
-  if (!userArg || !['monthly', 'lifetime'].includes(typeArg)) {
-    await ctx.reply(
-        '用法:\n' +
-        '  /grant <@username|user_id> monthly <付款日 YYYY-MM-DD>\n' +
-        '  /grant <@username|user_id> lifetime\n\n' +
-        '示例:\n' +
-        '  /grant @max123 monthly 2026-06-04\n' +
-        '  /grant 123456789 lifetime\n\n' +
-        '月度会员必须指定付款日,系统会自动 +30 天作为到期日。'
-    );
-    return;
-  }
-
-  // 月度必须传付款日
-  let paidAt = null;
-  if (typeArg === 'monthly') {
-    if (!dateArg) {
-      await ctx.reply(
-          '月度会员必须指定付款日 (YYYY-MM-DD),系统会自动 +30 天作为到期日。\n' +
-          '示例: /grant @max123 monthly 2026-06-04'
-      );
-      return;
-    }
-    paidAt = new Date(`${dateArg}T00:00:00+08:00`);
-    if (isNaN(paidAt.getTime())) {
-      await ctx.reply('日期格式错误,应为 YYYY-MM-DD (例: 2026-06-04)');
-      return;
-    }
-  }
-
-  // 解析用户
+async function resolveGrantTarget(userArg) {
   const parsed = parseUserArg(userArg);
-  if (parsed.error) {
-    await ctx.reply(parsed.error);
-    return;
-  }
-  let targetUserId = parsed.tgUserId;
-  if (!targetUserId && parsed.username) {
+  if (parsed.error) return { error: parsed.error };
+  if (parsed.tgUserId) return { tgUserId: parsed.tgUserId };
+  if (parsed.username) {
     const u = await findTgUserByUsername(parsed.username);
     if (!u) {
-      await ctx.reply(
-          `用户 @${parsed.username} 未与 bot 互动过,无法解析。\n` +
-          `请让 ta 先私聊 bot 发 /start,或直接传数字 user_id。`
-      );
-      return;
+      return {
+        error:
+            `用户 @${parsed.username} 未与 bot 互动过,无法解析。\n` +
+            `请让 ta 先私聊 bot 发 /start,或直接传数字 user_id。`,
+      };
     }
-    targetUserId = u.tg_user_id;
+    return { tgUserId: u.tg_user_id };
   }
+  return { error: '无法解析用户' };
+}
 
-  // 决定 expires_at
+async function performGrant({ adminId, targetUserId, type, paidAt, dateLabel }) {
   const existing = await getMembership(targetUserId);
   let expiresAt;
-  let calcExplain = ''; // 给 admin 看的算法解释
-  if (typeArg === 'lifetime') {
+  let calcExplain = '';
+  if (type === 'lifetime') {
     expiresAt = LIFETIME_FAR_FUTURE;
   } else {
-    // monthly:
-    //   - 全新 / 复活 (expired/revoked): 付款日 + 30 天
-    //   - 续费 (active): max(原 expires_at, 付款日) + 30 天
-    //     这样提前续费不吃亏 (用原到期日为基准), 延后续费不送时间 (用付款日为基准)
     const isRenewal =
         existing && existing.type === 'monthly' && existing.status === 'active';
     if (isRenewal) {
@@ -440,17 +400,15 @@ bot.command('grant', async (ctx) => {
       expiresAt = new Date(baseDate.getTime() + 30 * 24 * 3600 * 1000);
       calcExplain = useExisting
           ? `续费 (原到期 ${formatDate(existingExpires)} 比付款日晚) → ${formatDate(expiresAt)}`
-          : `续费 (付款日 ${dateArg} 比原到期日晚) → ${formatDate(expiresAt)}`;
+          : `续费 (付款日 ${dateLabel} 比原到期日晚) → ${formatDate(expiresAt)}`;
     } else {
       expiresAt = new Date(paidAt.getTime() + 30 * 24 * 3600 * 1000);
-      calcExplain = `付款日 ${dateArg} + 30 天 → ${formatDate(expiresAt)}`;
+      calcExplain = `付款日 ${dateLabel} + 30 天 → ${formatDate(expiresAt)}`;
     }
   }
 
-  // 虚拟订单号 (MANUAL- 前缀)
   const manualOrderId = `MANUAL-${Date.now()}-${targetUserId}`;
 
-  // 邀请链接
   let inviteLink = null;
   try {
     inviteLink = await createInviteLink();
@@ -460,7 +418,7 @@ bot.command('grant', async (ctx) => {
 
   await upsertMembership({
     tgUserId: targetUserId,
-    type: typeArg,
+    type,
     startedAt: new Date(),
     expiresAt,
     currentOrderId: manualOrderId,
@@ -471,22 +429,143 @@ bot.command('grant', async (ctx) => {
   await logAdminAction(
       'grant',
       targetUserId,
-      `by_admin=${ctx.from.id} type=${typeArg} paid=${dateArg || '-'} expires=${expiresAt.toISOString()}`
+      `by_admin=${adminId} type=${type} paid=${dateLabel || '-'} expires=${expiresAt.toISOString()}`
   );
 
-  // 给目标用户 DM (不暴露算法细节)
-  const typeLabel = typeArg === 'lifetime' ? '永久会员' : '月度会员';
+  const typeLabel = type === 'lifetime' ? '永久会员' : '月度会员';
   const userExpiryLine =
-      typeArg === 'lifetime' ? '永久有效' : `有效期至 ${formatDate(expiresAt)}`;
+      type === 'lifetime' ? '永久有效' : `有效期至 ${formatDate(expiresAt)}`;
   let userMsg = `✅ 管理员已为你开通 <b>${typeLabel}</b>\n📅 ${userExpiryLine}`;
   if (inviteLink) userMsg += `\n\n🔗 频道邀请链接 (24h):\n${inviteLink}`;
   const dmOk = await dmUser(targetUserId, userMsg);
 
-  // 回复 admin (展示算法)
   let adminMsg = `✅ user_id=${targetUserId} → ${typeLabel}\n📅 ${calcExplain || '永久有效'}`;
   if (!dmOk) adminMsg += `\n⚠️ 无法 DM 用户 (ta 没 /start 过 bot),你需要手动告知`;
   if (!inviteLink) adminMsg += `\n⚠️ 邀请链接生成失败`;
+  return adminMsg;
+}
+
+function todayShanghaiMidnight() {
+  // 上海时区今天 00:00, 跟手动传 YYYY-MM-DD 时的语义保持一致
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date()); // -> "YYYY-MM-DD"
+  return { date: parts, paidAt: new Date(`${parts}T00:00:00+08:00`) };
+}
+
+bot.command('grant', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+  const parts = ctx.message.text.split(/\s+/);
+  const userArg = parts[1];
+  const typeArg = parts[2];
+  const dateArg = parts[3];
+
+  if (!userArg) {
+    await ctx.reply(
+        '用法:\n' +
+        '  /grant <@username|user_id>            ← 弹按钮选月度/永久\n' +
+        '  /grant <@username|user_id> monthly [YYYY-MM-DD]\n' +
+        '  /grant <@username|user_id> lifetime\n\n' +
+        'monthly 不传日期默认按今天算付款日。'
+    );
+    return;
+  }
+
+  const target = await resolveGrantTarget(userArg);
+  if (target.error) {
+    await ctx.reply(target.error);
+    return;
+  }
+  const targetUserId = target.tgUserId;
+
+  // 无类型 → 弹按钮
+  if (!typeArg) {
+    await ctx.reply(
+        `请选择要为 user_id=${targetUserId} 开通的会员类型:`,
+        {
+          reply_markup: {
+            inline_keyboard: [[
+              { text: '📅 开月度会员 (今天起)', callback_data: `grant:monthly:${targetUserId}` },
+              { text: '♾️ 开永久会员', callback_data: `grant:lifetime:${targetUserId}` },
+            ]],
+          },
+        }
+    );
+    return;
+  }
+
+  if (!['monthly', 'lifetime'].includes(typeArg)) {
+    await ctx.reply('类型只能是 monthly 或 lifetime');
+    return;
+  }
+
+  let paidAt = null;
+  let dateLabel = null;
+  if (typeArg === 'monthly') {
+    if (dateArg) {
+      paidAt = new Date(`${dateArg}T00:00:00+08:00`);
+      if (isNaN(paidAt.getTime())) {
+        await ctx.reply('日期格式错误,应为 YYYY-MM-DD (例: 2026-06-04)');
+        return;
+      }
+      dateLabel = dateArg;
+    } else {
+      const today = todayShanghaiMidnight();
+      paidAt = today.paidAt;
+      dateLabel = `${today.date} (今天)`;
+    }
+  }
+
+  const adminMsg = await performGrant({
+    adminId: ctx.from.id,
+    targetUserId,
+    type: typeArg,
+    paidAt,
+    dateLabel,
+  });
   await ctx.reply(adminMsg);
+});
+
+bot.action(/^grant:(monthly|lifetime):(\d+)$/, async (ctx) => {
+  if (!isAdmin(ctx.from.id)) {
+    await ctx.answerCbQuery('无权限', { show_alert: true });
+    return;
+  }
+  const type = ctx.match[1];
+  const targetUserId = Number(ctx.match[2]);
+
+  await ctx.answerCbQuery('处理中...');
+
+  let paidAt = null;
+  let dateLabel = null;
+  if (type === 'monthly') {
+    const today = todayShanghaiMidnight();
+    paidAt = today.paidAt;
+    dateLabel = `${today.date} (今天)`;
+  }
+
+  let adminMsg;
+  try {
+    adminMsg = await performGrant({
+      adminId: ctx.from.id,
+      targetUserId,
+      type,
+      paidAt,
+      dateLabel,
+    });
+  } catch (err) {
+    logger.error({ err: err.message, targetUserId, type }, 'grant button failed');
+    await ctx.editMessageText(`❌ 开通失败: ${err.message}`).catch(() => {});
+    return;
+  }
+
+  // 把按钮消息直接替换为结果, 避免重复点击
+  await ctx.editMessageText(adminMsg).catch(async () => {
+    await ctx.reply(adminMsg);
+  });
 });
 
 // ============================================================
