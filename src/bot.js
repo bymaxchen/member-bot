@@ -91,6 +91,7 @@ bot.use(async (ctx, next) => {
 bot.start(async (ctx) => {
   await ctx.reply(
       `你好,我是会员管理 bot 👋\n\n` +
+      `你的用户 ID: <code>${ctx.from.id}</code>\n\n` +
       `<b>购买会员</b>\n` +
       `  永久会员 119 元：\n` +
       `  https://www.fansky.co/aiglobalclass/18\n\n` +
@@ -343,7 +344,9 @@ bot.command('status', async (ctx) => {
   const m = await getMembership(ctx.from.id);
   if (!m) {
     await ctx.reply(
-        '你还不是会员。\n如已购买,发订单号给我自助开通 (FS-xxx 或 FSM-xxx)。'
+        `你的用户 ID: <code>${ctx.from.id}</code>\n\n` +
+        '你还不是会员。\n如已购买,发订单号给我自助开通 (FS-xxx 或 FSM-xxx)。',
+        { parse_mode: 'HTML' }
     );
     return;
   }
@@ -351,7 +354,8 @@ bot.command('status', async (ctx) => {
   const statusLabel =
       m.status === 'active' ? '✅ 有效' : m.status === 'expired' ? '⏰ 已过期' : '🚫 已撤销';
 
-  let msg = `<b>会员状态</b>\n  类型: ${typeLabel}\n  状态: ${statusLabel}\n`;
+  let msg =
+      `<b>会员状态</b>\n  用户 ID: <code>${ctx.from.id}</code>\n  类型: ${typeLabel}\n  状态: ${statusLabel}\n`;
   if (m.type === 'monthly') {
     msg += `  到期: ${formatDate(m.expires_at)}\n`;
     if (m.status === 'active') {
