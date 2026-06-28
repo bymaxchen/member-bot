@@ -115,9 +115,42 @@ export async function initSchema() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     `);
 
+    // 记录所有跟 bot 互动过的 TG 用户. 给 /grant @username 用 (用户名 → user_id 反查)
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS tg_users (
+        tg_user_id BIGINT PRIMARY KEY,
+        username VARCHAR(128) NULL,
+        first_name VARCHAR(128) NULL,
+        first_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        KEY idx_username (username)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `);
+
+    // 幂等列迁移 (v0.3.0 加上去的字段, 已有 DB 也能升级)
+    await ensureColumn(conn, 'memberships', 'last_reminder_days', 'INT NULL');
+    await ensureColumn(
+      conn,
+      'memberships',
+      'last_reminder_for_expires_at',
+      'DATETIME NULL'
+    );
+
     logger.debug('Schema ensured');
   } finally {
     conn.release();
+  }
+}
+
+async function ensureColumn(conn, table, column, definition) {
+  const [rows] = await conn.execute(
+    `SELECT COUNT(*) AS n FROM information_schema.COLUMNS
+       WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`,
+    [table, column]
+  );
+  if (rows[0].n === 0) {
+    await conn.query(`ALTER TABLE \`${table}\` ADD COLUMN \`${column}\` ${definition}`);
+    logger.info({ table, column }, 'Added column');
   }
 }
 
@@ -200,17 +233,6 @@ export async function getUnknownTypeOrders() {
   return rows;
 }
 
-// 给 bot 用: 查某个订阅最新的周期结束时间
-// (bot 自动延期会员时调用)
-export async function getLatestPeriodEnd(subscriptionNo) {
-  const [rows] = await pool.execute(
-    `SELECT MAX(period_end_at) AS latest FROM orders
-       WHERE subscription_no = ? AND status_enum = 'Paid'`,
-    [subscriptionNo]
-  );
-  return rows[0]?.latest ?? null;
-}
-
 // ---------- Cookies ----------
 const COOKIES_KEY = 'fansky_cookies';
 
@@ -234,6 +256,206 @@ export async function saveCookiesToDb(cookieObj) {
        ON DUPLICATE KEY UPDATE v = VALUES(v)`,
     [COOKIES_KEY, JSON.stringify(cookieObj)]
   );
+}
+
+// ---------- Bot: 订单查询 ----------
+export async function getOrderByExternalId(externalOrderId) {
+  const [rows] = await pool.execute(
+    'SELECT * FROM orders WHERE external_order_id = ? LIMIT 1',
+    [externalOrderId]
+  );
+  return rows[0] || null;
+}
+
+// 原子认领订单: 只在 claimed_by_tg_user_id IS NULL 时更新.
+// 返回 affectedRows=1 表示认领成功, =0 表示已被认领或不存在.
+export async function claimOrder(externalOrderId, tgUserId) {
+  const [result] = await pool.execute(
+    `UPDATE orders SET claimed_by_tg_user_id = ?, claimed_at = NOW()
+       WHERE external_order_id = ? AND claimed_by_tg_user_id IS NULL`,
+    [tgUserId, externalOrderId]
+  );
+  return result;
+}
+
+// ---------- Bot: 会员状态 ----------
+export async function getMembership(tgUserId) {
+  const [rows] = await pool.execute(
+    'SELECT * FROM memberships WHERE tg_user_id = ? LIMIT 1',
+    [tgUserId]
+  );
+  return rows[0] || null;
+}
+
+// 入会 / 续期 / 复活 (一个用户主键, INSERT OR UPDATE)
+export async function upsertMembership(m) {
+  await pool.execute(
+    `INSERT INTO memberships
+       (tg_user_id, type, started_at, expires_at, status,
+        current_order_id, current_subscription_no, last_invite_link)
+     VALUES (?, ?, ?, ?, 'active', ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+       type = VALUES(type),
+       started_at = VALUES(started_at),
+       expires_at = VALUES(expires_at),
+       status = 'active',
+       current_order_id = VALUES(current_order_id),
+       current_subscription_no = VALUES(current_subscription_no),
+       last_invite_link = VALUES(last_invite_link),
+       last_reminder_days = NULL,
+       last_reminder_for_expires_at = NULL`,
+    [
+      m.tgUserId,
+      m.type,
+      m.startedAt,
+      m.expiresAt,
+      m.currentOrderId ?? null,
+      m.currentSubscriptionNo ?? null,
+      m.lastInviteLink ?? null,
+    ]
+  );
+}
+
+export async function extendMonthly(tgUserId, newExpiresAt) {
+  await pool.execute(
+    `UPDATE memberships
+        SET expires_at = ?,
+            status = 'active',
+            last_reminder_days = NULL,
+            last_reminder_for_expires_at = NULL
+      WHERE tg_user_id = ?`,
+    [newExpiresAt, tgUserId]
+  );
+}
+
+export async function setMembershipStatus(tgUserId, status) {
+  await pool.execute(
+    `UPDATE memberships SET status = ? WHERE tg_user_id = ?`,
+    [status, tgUserId]
+  );
+}
+
+export async function markReminderSent(tgUserId, daysBefore, expiresAt) {
+  await pool.execute(
+    `UPDATE memberships
+        SET last_reminder_days = ?, last_reminder_for_expires_at = ?
+      WHERE tg_user_id = ?`,
+    [daysBefore, expiresAt, tgUserId]
+  );
+}
+
+// ---------- Cron 查询 ----------
+
+// 续费检测: 所有 active monthly 会员
+export async function getActiveMonthlyMembers() {
+  const [rows] = await pool.query(
+    `SELECT tg_user_id, current_subscription_no, expires_at
+       FROM memberships
+      WHERE status = 'active'
+        AND type = 'monthly'
+        AND current_subscription_no IS NOT NULL`
+  );
+  return rows;
+}
+
+// 到期提醒: monthly 会员, 距离过期 7/3/1 天
+export async function getMembershipsForReminder() {
+  const [rows] = await pool.query(
+    `SELECT tg_user_id, expires_at,
+            last_reminder_days, last_reminder_for_expires_at,
+            DATEDIFF(expires_at, NOW()) AS days_until
+       FROM memberships
+      WHERE status = 'active'
+        AND type = 'monthly'
+        AND DATEDIFF(expires_at, NOW()) IN (7, 3, 1)`
+  );
+  return rows;
+}
+
+// 清理: monthly 会员, 过期超过 24h
+export async function getMembershipsToCleanup() {
+  const [rows] = await pool.query(
+    `SELECT tg_user_id, expires_at
+       FROM memberships
+      WHERE status = 'active'
+        AND type = 'monthly'
+        AND expires_at < DATE_SUB(NOW(), INTERVAL 24 HOUR)`
+  );
+  return rows;
+}
+
+// 给 bot 自动续费检测用: 某订阅当前最新的周期结束时间
+export async function getLatestPeriodEnd(subscriptionNo) {
+  const [rows] = await pool.execute(
+    `SELECT MAX(period_end_at) AS latest
+       FROM orders
+      WHERE subscription_no = ? AND status_enum = 'Paid'`,
+    [subscriptionNo]
+  );
+  return rows[0]?.latest ?? null;
+}
+
+// ---------- Bot: 防扫号 ----------
+export async function recordVerifyAttempt(tgUserId, orderId, success, reason) {
+  await pool.execute(
+    `INSERT INTO verify_attempts (tg_user_id, attempted_order_id, success, reason)
+     VALUES (?, ?, ?, ?)`,
+    [tgUserId, orderId, success ? 1 : 0, reason]
+  );
+}
+
+export async function countRecentVerifyFailures(tgUserId, withinMinutes) {
+  const [rows] = await pool.execute(
+    `SELECT COUNT(*) AS n FROM verify_attempts
+      WHERE tg_user_id = ?
+        AND success = 0
+        AND attempted_at > DATE_SUB(NOW(), INTERVAL ? MINUTE)`,
+    [tgUserId, withinMinutes]
+  );
+  return rows[0].n;
+}
+
+// ---------- Bot: 用户名解析 ----------
+export async function recordTgUser(tgUserId, username, firstName) {
+  await pool.execute(
+    `INSERT INTO tg_users (tg_user_id, username, first_name)
+     VALUES (?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+       username = VALUES(username),
+       first_name = VALUES(first_name)`,
+    [tgUserId, username ?? null, firstName ?? null]
+  );
+}
+
+export async function findTgUserByUsername(username) {
+  // username 不带 @
+  const clean = username.replace(/^@/, '');
+  const [rows] = await pool.execute(
+    `SELECT * FROM tg_users WHERE username = ? LIMIT 1`,
+    [clean]
+  );
+  return rows[0] || null;
+}
+
+// ---------- Bot: admin log ----------
+export async function logAdminAction(action, tgUserId, details) {
+  await pool.execute(
+    `INSERT INTO admin_log (action, tg_user_id, details) VALUES (?, ?, ?)`,
+    [action, tgUserId ?? null, details ?? null]
+  );
+}
+
+// ---------- Bot: 管理用统计 ----------
+export async function getMembershipStats() {
+  const [byType] = await pool.query(
+    `SELECT type, status, COUNT(*) AS n FROM memberships GROUP BY type, status`
+  );
+  const [[expiringSoon]] = await pool.query(
+    `SELECT COUNT(*) AS n FROM memberships
+      WHERE status = 'active' AND type = 'monthly'
+        AND expires_at < DATE_ADD(NOW(), INTERVAL 7 DAY)`
+  );
+  return { byType, monthlyExpiringIn7d: expiringSoon.n };
 }
 
 export async function closePool() {

@@ -1,151 +1,160 @@
 # membership-sync
 
-爬取 Fansky 创作者后台订单 (商品+订阅两个 API) → 同步到 MySQL,给后续 TG bot 用。
+Fansky 订单同步 + Telegram 会员管理 bot,单 Node.js 进程一把梭。
 
 ## 架构
 
 ```
-                  ┌──────────────────────────┐
-                  │  Fansky 商品订单 API     │ ───► 永久会员 (FS-xxx)
-[5 min cron]──► │                          │
-                  │  Fansky 订阅订单 API     │ ───► 月度会员 (FSM-xxx)
-                  └────────────┬─────────────┘
-                               │ 带 cookie 调用
-                               ▼
-                       ┌───────────────┐
-                       │  Cloud MySQL  │  ◄── TG bot 后续读这里
-                       └───────────────┘
+┌────────────────────────────────────────────────────────────┐
+│  单 Node.js 进程 (Railway)                                  │
+│                                                            │
+│  ┌──────────────┐    ┌──────────────────────────────────┐ │
+│  │  scraper     │    │  telegraf bot (polling)           │ │
+│  │  cron 5 min  │    │  /verify /grant /status /stats   │ │
+│  └──────┬───────┘    └──────────────┬───────────────────┘ │
+│         │                            │                     │
+│         │   ┌────────────────────────┴───────┐             │
+│         │   │  daily cron (10:00 Asia/SH)    │             │
+│         │   │  - 自动续费检测                 │             │
+│         │   │  - 到期提醒 (7/3/1天)          │             │
+│         │   │  - 过期清理 (宽限24h)          │             │
+│         │   └────────────────────────────────┘             │
+│         ▼                            ▲                     │
+│  ┌──────────────────────────────────┴──────┐              │
+│  │            Cloud MySQL (TiDB)            │              │
+│  └──────────────────────────────────────────┘              │
+└────────────────────────────────────────────────────────────┘
 ```
 
-### 设计要点
+## 用户交互流程
 
-- **两个 API 共享 cookies**: Fansky 同域,一份 session 都能用
-- **Cookies 存 DB 不存文件**: 容器 redeploy 文件就没了,DB 是唯一来源。首次跑从 `data/cookies.json` bootstrap 进 DB,之后就靠 DB
-- **滑动续期自动持久化**: 每次 API 响应 `Set-Cookie` 都覆盖 DB,理论上长期不用手动刷新
-- **增量抓取**: 从第 1 页开始,遇到本页 0 个新订单就停。正常情况每 API 每次 5 分钟只调 1 次
-- **类型识别按 API 来源定**: 商品 API 出来的全是 lifetime (已按 `productName=会员` 过滤),订阅 API 出来的全是 monthly。金额对不上只 warn 不阻断 (因为你会涨价)
+### 新会员入会
 
-## 本地跑
+1. 用户在 Fansky 付款,拿到订单号 (FS-xxx = 永久 / FSM-xxx = 月度)
+2. 给 bot 私聊订单号 (智能识别) 或 `/verify FS-xxx`
+3. Bot 验证 → 写 `memberships` → 生成单次 24h 邀请链接 → DM 给用户
 
-```bash
-# 1. 装依赖
-npm install
+### 月度自动续费 (零交互)
 
-# 2. 配置 .env
-cp .env.example .env
-# 编辑 .env, 填上 DATABASE_URL
+1. 用户在 Fansky 续费 (产生新订单,但 `subscription_no` 不变)
+2. 爬虫 5 分钟内同步到 DB
+3. 每天 10:00 daily cron 跑续费检测,发现新 `period_end_at` 比 `expires_at` 新
+4. 自动 UPDATE `memberships.expires_at`,静默无提醒
 
-# 3. 准备 cookies
-# 浏览器登录 Fansky → F12 → Application → Cookies → www.fansky.net
-# 复制 session 和 session.sig 的值
-mkdir -p data
-cat > data/cookies.json <<'EOF'
-{
-  "session": "rp:sess:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-  "session.sig": "xxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-}
-EOF
+### 月度未续费 → 提醒 → 踢出
 
-# 4. 跑一次
-npm run scrape:once
+1. 到期前 7/3/1 天 daily cron DM 提醒 (附 Fansky 续费链接)
+2. 到期当天没续费 → 24h 宽限期
+3. 24h 后 daily cron `banChatMember + unbanChatMember` (踢出但允许重新加入) + 标记 `expired`
 
-# 5. 看 DB
-npm run db:peek
+### 手动支付宝/微信入账 (admin)
 
-# 6. 长期运行
-npm start
+- `/grant @user monthly` → 默认 NOW+30天
+- `/grant @user monthly 2026-07-28` → 指定到期日
+- `/grant @user lifetime` → 永久
+- 现有 active monthly 用户调用 = 在原 `expires_at` 上 +30 天 (续费场景,不吃亏)
+- 自动检测用户是否已在频道,在的话跳过邀请链接
+
+### 撤销 / 统计
+
+- `/revoke @user` — admin 撤销 + 踢出
+- `/stats` — admin 看 byType×status 计数 + 7 天内将到期数
+
+## 部署
+
+### 环境变量
+
+```env
+DATABASE_URL=mysql://...
+MONTHLY_PRICE=29
+LIFETIME_PRICE=119
+SCRAPE_CRON=*/5 * * * *
+DAILY_CRON=0 10 * * *
+
+TG_BOT_TOKEN=xxx:yyy
+TG_CHANNEL_ID=-1001234567890
+TG_ADMIN_IDS=123456789,987654321
+FANSKY_SUBSCRIBE_URL=https://www.fansky.net/...
+
+NODE_ENV=production
+LOG_LEVEL=info
 ```
 
-> 只需要 `session` 和 `session.sig`,其它 cookie (`locale`/`theme`/`_ga*`) 不是身份凭证,不用复制。
+### Railway
 
-## 部署到 Railway
+把代码 push 到 GitHub → Railway 新增上面的环境变量 → Deploy。
 
-1. push 代码到 GitHub
-2. Railway 新建 service,从 GitHub 部署
-3. 配 Variables:
-   - `DATABASE_URL` — 同一个云 MySQL
-   - `MONTHLY_PRICE=29`,`LIFETIME_PRICE=119`
-   - `NODE_ENV=production`
-   - `SCRAPE_CRON=*/5 * * * *`
-4. Deploy
+启动后看 logs 应该看到:
+- `membership-sync starting`
+- `Bot launched (polling)`
+- `Scrape cron scheduled`
+- `Daily cron scheduled`
+- `Scrape complete` (第一次立即执行的)
 
-不用配 `COOKIE_FILE`——本地首次跑时 cookies 已经进了 DB,Railway 直接读 DB 就行。
+### Bot 准备工作
 
-### Cookie 过期了怎么办
+1. `@BotFather` 创建 bot → 拿 token
+2. 把 bot 拉进你频道,给"邀请用户"、"封禁/解封成员"权限
+3. 把你频道一条消息转发给 `@userinfobot` → 拿频道 ID (负数,以 `-100` 开头)
+4. 私聊 `@userinfobot` 拿你自己的 user_id (admin 白名单)
 
-爬虫检测到 401 / 403 / 302 / 非 JSON 响应,会停止重试并报 fatal log:
+## 命令汇总
 
-```
-!!! COOKIES EXPIRED — refresh `fansky_cookies` row in app_config and restart !!!
-```
+| 命令 | 谁能用 | 作用 |
+|---|---|---|
+| `/start` | 任何人 | 引导文案 |
+| `/help` | 任何人 | 命令列表 |
+| 发送 `FS-xxx` / `FSM-xxx` | 任何人 | 智能识别认领 |
+| `/verify <订单号>` | 任何人 | 显式认领 |
+| `/status` | 任何人 | 看自己的会员状态 |
+| `/grant <user> monthly\|lifetime [日期]` | admin | 手动开通 |
+| `/revoke <user>` | admin | 撤销 + 踢出 |
+| `/stats` | admin | 总览 |
 
-修复:
-
-1. 浏览器重新登录 Fansky,F12 复制新 `session` 和 `session.sig`
-2. 更新 DB:
-   ```sql
-   UPDATE app_config
-      SET v = '{"session":"NEW","session.sig":"NEW"}'
-    WHERE k = 'fansky_cookies';
-   ```
-3. Railway dashboard → Restart
+`<user>` 支持 `@username` (需对方曾跟 bot 交互过) 或纯数字 `user_id`。
 
 ## 数据库表
 
 | 表 | 用途 |
 |---|---|
-| `orders` | 所有订单 (商品+订阅+手动支付宝/微信都在这) |
-| `memberships` | 用户当前会员状态 (爬虫不写,bot 写) |
-| `verify_attempts` | 用户校验订单号的尝试记录 |
-| `admin_log` | 操作留痕 |
-| `app_config` | KV,目前存 cookies |
+| `orders` | 所有订单 (Fansky 商品+订阅, 手动支付宝/微信) |
+| `memberships` | 用户当前会员状态 |
+| `verify_attempts` | 防扫号 (10 min 内 5 次错限流) |
+| `tg_users` | TG 用户名 ↔ user_id 映射 (给 `/grant @username` 用) |
+| `admin_log` | 所有自动/手动操作留痕 |
+| `app_config` | KV,目前只存 cookies |
 
-### `orders` 关键字段
+`memberships` 加了两个跟踪续费提醒的字段:
+- `last_reminder_days`: 上次发的是 7/3/1 哪个
+- `last_reminder_for_expires_at`: 上次提醒针对的 expires_at (续费后 expires_at 变了, 自动重置)
 
-| 字段 | 商品订单 | 订阅订单 |
-|---|---|---|
-| `external_order_id` | `tradeNo` (FS-xxx) | `orderNo` (FSM-xxx) |
-| `source` | `fansky_product` | `fansky_subscription` |
-| `type` | `lifetime` | `monthly` |
-| `subscription_no` | NULL | UUID,**跨续费保持不变** |
-| `period_end_at` | NULL | 当前订阅周期结束时间 |
-| `subscription_action` | NULL | `initial_purchase` / `renewal` / ... |
-| `tier_id`, `tier_name` | NULL | Fansky 的订阅 tier |
-| `product_id`, `product_name` | 商品信息 | NULL |
+## 关键设计点
 
-订单号 (`external_order_id`) 唯一,FS- 和 FSM- 不会冲突。
+1. **续费完全自动**: 利用 Fansky 订阅 API 的 `subscription_no` 跨续费不变,daily cron 自动 UPDATE `expires_at`,用户不用碰 bot
+2. **`/grant` 续费不吃亏**: admin 手动 grant 一个已 active 的 monthly 用户,在原 `expires_at` 上 +30 天,不是 NOW+30
+3. **踢人 = ban + unban**: 直接 ban 会让用户以后想付费重进群都进不来,ban+unban 等于"踢出但允许再加入"
+4. **24h 宽限**: 避免时差和 Fansky 支付延迟误伤
+5. **Cookie 失效 DM admin**: 之前的 fatal log 现在还会 DM 你,你能立刻知道
+6. **防扫号**: 同 tg_user 10 min 内 5 次错限流
 
-### 给 bot 用的辅助函数
+## 升级 (v0.2 → v0.3)
 
-`db.js` 里 `getLatestPeriodEnd(subscriptionNo)` 返回某个订阅最新的周期结束时间——bot 处理续费时直接用这个值更新 `memberships.expires_at`,不用自己算 30 天。
+DB 改动是幂等的 (`ensureColumn` 自动加新字段),老数据不丢:
 
-## 类型识别逻辑
+- `memberships` 加 `last_reminder_days`, `last_reminder_for_expires_at`
+- 新建 `tg_users` 表
 
-简化版,按 API 来源确定:
+正常 deploy 重启就行,无需 drop。
 
-- 商品 API (已过滤 `productName=会员`) → `lifetime`
-- 订阅 API → `monthly`
+## 已知局限
 
-金额不匹配 `MONTHLY_PRICE` / `LIFETIME_PRICE` 时只输出 warn log,不阻断 (适配涨价场景)。
+- Bot DM 用户前提是用户曾经 `/start` 过 bot (TG 限制)。手动 `/grant` 没 /start 过的用户,DM 会失败,要你手动转告
+- `/grant @username` 也依赖对方曾跟 bot 互动 (否则用 numeric user_id)
+- 用户自己点 "离开频道" bot 不感知 (除非主动监听 chat_member 事件,后续可加)
 
-**涨价**: 改 `.env` 的价格变量,老订单不受影响 (类型在入库时已定下)。
+## 下一步可做
 
-## 后续路线
-
-- [ ] TG bot 模块: `/verify <订单号>`、`/grant` (手动录支付宝/微信)、`/revoke`
-- [ ] 月度会员到期 cron:
-  - 用 `getLatestPeriodEnd(subscription_no)` 比 `memberships.expires_at`,新则延期 (自动处理续费)
-  - 提前 7/3/1 天 DM 提醒续费
-  - 过期宽限 48h 后 `banChatMember + unbanChatMember`
-- [ ] 把 `TODO: TG bot DM` 那两处接进 bot 告警通道
-- [ ] 存量月度会员认领: 公告 + 截止日扫差集
-
-## 升级 (从 v0.1.0)
-
-v0.1.0 用的 SQLite + Playwright + 单 API。v0.2.0 是 MySQL + fetch + 双 API,schema 重写了。如果你跑过 v0.1.0,数据可以丢 (那时候是测试):
-
-```sql
-DROP TABLE IF EXISTS orders, memberships, verify_attempts, admin_log, app_config;
-```
-
-然后 `npm run scrape:once`,会重建表并从 Fansky 拉全部历史。
+- [ ] `/cookies set` admin 命令: 直接 DM 新 cookies, bot 写进 DB,不用手动 SQL
+- [ ] `chat_member` 事件: 用户自退后自动标记 expired
+- [ ] 每周/每月报表 DM admin: 新增会员、流失、续费率
+- [ ] inline 按钮: 提醒消息里直接放 "去 Fansky 续费" 按钮

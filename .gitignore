@@ -1,5 +1,7 @@
 node_modules/
 .env
 data/
+.idea/
+.claude/
 *.log
 .DS_Store
